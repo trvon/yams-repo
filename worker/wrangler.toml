@@ -1,0 +1,17 @@
+name = "yams-repo-worker"
+main = "src/worker.ts"
+compatibility_date = "2025-09-14"
+
+[vars]
+# Base paths inside R2 bucket
+APT_PREFIX = "aptrepo"
+YUM_PREFIX = "yumrepo"
+LATEST_MANIFEST = "latest.json"
+
+[[r2_buckets]]
+binding = "REPO_BUCKET"
+bucket_name = "yams-repository"
+preview_bucket_name = "yams-repository-preview"
+
+[observability]
+enabled = true
