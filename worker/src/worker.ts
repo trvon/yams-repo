@@ -30,6 +30,7 @@
 
 export interface Env {
   REPO_BUCKET: R2Bucket;
+  RATE_LIMITER: RateLimit;
   APT_PREFIX: string;
   YUM_PREFIX: string;
   LATEST_MANIFEST: string;
@@ -47,6 +48,7 @@ const TEXT_TYPES: Record<string, string> = {
   '.json': 'application/json; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
   '.md': 'text/markdown; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
   'Release': 'text/plain; charset=utf-8',
   'InRelease': 'text/plain; charset=utf-8',
   'Packages': 'text/plain; charset=utf-8',
@@ -89,9 +91,40 @@ function notFound(msg: string, cfId?: string) {
   });
 }
 
-async function serveObject(env: Env, key: string, req: Request): Promise<Response> {
+async function serveObjectOrDirectory(
+  env: Env,
+  key: string,
+  displayPath: string,
+  req: Request
+): Promise<Response> {
+  // Check if path ends with / (directory request)
+  if (displayPath.endsWith('/')) {
+    const acceptJson = req.headers.get('Accept')?.includes('application/json') || false;
+    return listDirectory(env, key, displayPath, acceptJson);
+  }
+
+  // Try to serve as file
   const obj = await env.REPO_BUCKET.get(key);
-  if (!obj) return notFound('object not found', req.headers.get('CF-Ray') || undefined);
+
+  // If object not found, check if this should be a directory redirect
+  if (!obj) {
+    // Try listing with this prefix to see if it's a directory
+    const listing = await env.REPO_BUCKET.list({
+      prefix: key.endsWith('/') ? key : key + '/',
+      delimiter: '/',
+      limit: 1,
+    });
+
+    if (listing.objects.length > 0 || listing.delimitedPrefixes.length > 0) {
+      // This is a directory, redirect to add trailing slash
+      return new Response(null, {
+        status: 301,
+        headers: { Location: displayPath + '/' },
+      });
+    }
+
+    return notFound('object not found', req.headers.get('CF-Ray') || undefined);
+  }
 
   const headers = new Headers();
   addSecurityHeaders(headers);
@@ -122,20 +155,372 @@ function normalizePath(p: string): string {
   return p;
 }
 
-// Minimal type shims if not using @cloudflare/workers-types in build environment
-// (These allow local linting without full type package.)
-// Remove if you add workers-types dev dependency.
-// @ts-ignore
-interface R2ObjectBody { body: ReadableStream; httpEtag?: string; arrayBuffer(): Promise<ArrayBuffer>; }
-// @ts-ignore
-interface R2Bucket { get(key: string): Promise<R2ObjectBody | null>; }
-// @ts-ignore
-interface ExecutionContext { waitUntil(p: Promise<any>): void; }
+function escapeHtml(unsafe: string): string {
+  return unsafe
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+}
+
+async function listDirectory(env: Env, prefix: string, displayPath: string, acceptJson: boolean): Promise<Response> {
+  // Ensure prefix doesn't start with /
+  const normalizedPrefix = normalizePath(prefix);
+
+  // List objects with delimiter to get "directory-like" structure
+  const listing = await env.REPO_BUCKET.list({
+    prefix: normalizedPrefix,
+    delimiter: '/',
+  });
+
+  if (listing.objects.length === 0 && listing.delimitedPrefixes.length === 0) {
+    return notFound('directory not found');
+  }
+
+  // Extract just the filenames/dirnames from the full keys
+  const files = listing.objects.map(obj => ({
+    name: obj.key.substring(normalizedPrefix.length),
+    size: obj.size,
+    modified: obj.uploaded,
+    isDir: false,
+  }));
+
+  const dirs = listing.delimitedPrefixes.map(prefix => ({
+    name: prefix.substring(normalizedPrefix.length),
+    size: 0,
+    modified: new Date(),
+    isDir: true,
+  }));
+
+  // Sort: directories first, then files (alphabetically)
+  const allEntries = [
+    ...dirs.sort((a, b) => a.name.localeCompare(b.name)),
+    ...files.sort((a, b) => a.name.localeCompare(b.name)),
+  ];
+
+  const headers = new Headers();
+  addSecurityHeaders(headers);
+
+  // Content negotiation
+  if (acceptJson) {
+    headers.set('Content-Type', 'application/json; charset=utf-8');
+    return new Response(JSON.stringify({
+      path: displayPath,
+      files: allEntries.map(e => e.name),
+    }, null, 2), { headers });
+  }
+
+  // Generate HTML listing
+  const breadcrumbs = generateBreadcrumbs(displayPath);
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Index of ${escapeHtml(displayPath)}</title>
+  <style>
+    body { font-family: monospace; margin: 2em; background: #f5f5f5; }
+    h1 { border-bottom: 2px solid #333; padding-bottom: 0.5em; }
+    .breadcrumb { margin: 1em 0; font-size: 0.9em; }
+    .breadcrumb a { color: #0066cc; text-decoration: none; }
+    .breadcrumb a:hover { text-decoration: underline; }
+    table { border-collapse: collapse; width: 100%; background: white; }
+    th { text-align: left; padding: 0.5em; background: #e0e0e0; border-bottom: 2px solid #333; }
+    td { padding: 0.5em; border-bottom: 1px solid #ddd; }
+    tr:hover { background: #f9f9f9; }
+    .name a { color: #0066cc; text-decoration: none; }
+    .name a:hover { text-decoration: underline; }
+    .dir { font-weight: bold; }
+    .size { text-align: right; }
+    .modified { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Index of ${escapeHtml(displayPath)}</h1>
+  ${breadcrumbs}
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th class="size">Size</th>
+        <th class="modified">Last Modified</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${displayPath !== '/' ? `
+      <tr>
+        <td class="name dir"><a href="../">../</a></td>
+        <td class="size">-</td>
+        <td class="modified">Parent Directory</td>
+      </tr>` : ''}
+      ${allEntries.map(entry => `
+      <tr>
+        <td class="name ${entry.isDir ? 'dir' : ''}">
+          <a href="${escapeHtml(entry.name)}">${escapeHtml(entry.name)}</a>
+        </td>
+        <td class="size">${entry.isDir ? '-' : formatBytes(entry.size)}</td>
+        <td class="modified">${entry.isDir ? '-' : entry.modified.toISOString().replace('T', ' ').substring(0, 19)}</td>
+      </tr>`).join('')}
+    </tbody>
+  </table>
+</body>
+</html>`;
+
+  headers.set('Content-Type', 'text/html; charset=utf-8');
+  headers.set('Cache-Control', 'public, max-age=60');
+  return new Response(html, { headers });
+}
+
+function generateBreadcrumbs(path: string): string {
+  if (path === '/') return '';
+
+  const parts = path.split('/').filter(p => p.length > 0);
+  const breadcrumbs = ['<div class="breadcrumb"><a href="/">Home</a>'];
+
+  let currentPath = '';
+  for (const part of parts) {
+    currentPath += '/' + part;
+    breadcrumbs.push(` / <a href="${currentPath}/">${escapeHtml(part)}</a>`);
+  }
+
+  breadcrumbs.push('</div>');
+  return breadcrumbs.join('');
+}
+
+function shouldRateLimit(path: string): boolean {
+  // Apply rate limiting to package downloads and API endpoints
+  // Skip rate limiting for directory listings and metadata files
+  return (
+    path.endsWith('.deb') ||
+    path.endsWith('.rpm') ||
+    path.endsWith('.tar.gz') ||
+    path.startsWith('/api/') ||
+    path === '/latest.json'
+  );
+}
+
+function rateLimitExceeded(): Response {
+  return new Response(
+    JSON.stringify({
+      error: 'Rate limit exceeded',
+      message: 'Too many requests. Please try again later.',
+      retry_after: 60,
+    }),
+    {
+      status: 429,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Retry-After': '60',
+      },
+    }
+  );
+}
+
+function addCorsHeaders(headers: Headers): void {
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  headers.set('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+function jsonResponse(data: unknown, status = 200, cacheMaxAge = 300): Response {
+  const headers = new Headers();
+  addSecurityHeaders(headers);
+  addCorsHeaders(headers);
+  headers.set('Content-Type', 'application/json; charset=utf-8');
+  headers.set('Cache-Control', `public, max-age=${cacheMaxAge}`);
+  return new Response(JSON.stringify(data, null, 2), { status, headers });
+}
+
+async function handlePluginApiList(env: Env): Promise<Response> {
+  // List all plugins by finding manifest.json files in plugins/*
+  const listing = await env.REPO_BUCKET.list({
+    prefix: 'plugins/',
+    delimiter: '/',
+  });
+
+  const plugins: unknown[] = [];
+
+  for (const prefix of listing.delimitedPrefixes) {
+    const pluginName = prefix.replace('plugins/', '').replace('/', '');
+    const manifestKey = `plugins/${pluginName}/manifest.json`;
+    const manifestObj = await env.REPO_BUCKET.get(manifestKey);
+
+    if (manifestObj) {
+      const manifestText = await manifestObj.text();
+      const manifest = JSON.parse(manifestText);
+      plugins.push({
+        name: manifest.name,
+        version: manifest.version,
+        description: manifest.description,
+        downloads: manifest.downloads || 0,
+      });
+    }
+  }
+
+  return jsonResponse({ plugins }, 200, 60);
+}
+
+async function handlePluginApiGet(env: Env, pluginName: string): Promise<Response> {
+  const manifestKey = `plugins/${pluginName}/manifest.json`;
+  const manifestObj = await env.REPO_BUCKET.get(manifestKey);
+
+  if (!manifestObj) {
+    return jsonResponse({ error: `Plugin '${pluginName}' not found` }, 404);
+  }
+
+  const manifestText = await manifestObj.text();
+  const manifest = JSON.parse(manifestText);
+  return jsonResponse(manifest, 200, 3600); // Cache 1 hour
+}
+
+async function handlePluginApiVersions(env: Env, pluginName: string): Promise<Response> {
+  // List all version directories for this plugin
+  const listing = await env.REPO_BUCKET.list({
+    prefix: `plugins/${pluginName}/`,
+    delimiter: '/',
+  });
+
+  const versions: string[] = [];
+
+  for (const prefix of listing.delimitedPrefixes) {
+    const versionMatch = prefix.match(/plugins\/[^/]+\/([^/]+)\//);
+    if (versionMatch && versionMatch[1] !== 'manifest.json') {
+      versions.push(versionMatch[1]);
+    }
+  }
+
+  if (versions.length === 0) {
+    return jsonResponse({ error: `No versions found for plugin '${pluginName}'` }, 404);
+  }
+
+  // Sort versions descending (semver-like)
+  versions.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+
+  return jsonResponse({ versions }, 200, 300);
+}
+
+async function handlePluginApiVersion(env: Env, pluginName: string, version: string): Promise<Response> {
+  const manifestKey = `plugins/${pluginName}/${version}/manifest.json`;
+  const manifestObj = await env.REPO_BUCKET.get(manifestKey);
+
+  if (!manifestObj) {
+    return jsonResponse({ error: `Version '${version}' not found for plugin '${pluginName}'` }, 404);
+  }
+
+  const manifestText = await manifestObj.text();
+  const manifest = JSON.parse(manifestText);
+  return jsonResponse(manifest, 200, 86400); // Cache 24 hours (immutable version)
+}
+
+async function handlePluginApiLatest(env: Env, pluginName: string): Promise<Response> {
+  // Get versions and return latest
+  const listing = await env.REPO_BUCKET.list({
+    prefix: `plugins/${pluginName}/`,
+    delimiter: '/',
+  });
+
+  const versions: string[] = [];
+  for (const prefix of listing.delimitedPrefixes) {
+    const versionMatch = prefix.match(/plugins\/[^/]+\/([^/]+)\//);
+    if (versionMatch && versionMatch[1] !== 'manifest.json') {
+      versions.push(versionMatch[1]);
+    }
+  }
+
+  if (versions.length === 0) {
+    return jsonResponse({ error: `Plugin '${pluginName}' not found` }, 404);
+  }
+
+  versions.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+  const latestVersion = versions[0];
+
+  return handlePluginApiVersion(env, pluginName, latestVersion);
+}
+
+async function handlePluginApiInstall(req: Request): Promise<Response> {
+  try {
+    const body = await req.json() as { version?: string; platform?: string; yams_version?: string };
+
+    if (!body.version || !body.platform || !body.yams_version) {
+      return jsonResponse({ error: 'Invalid request body. Required: version, platform, yams_version' }, 400);
+    }
+
+    // Track installation metrics (in production, this would update a counter in R2 or KV)
+    return jsonResponse({ success: true }, 200, 0);
+  } catch {
+    return jsonResponse({ error: 'Invalid JSON body' }, 400);
+  }
+}
+
+async function handlePluginApi(env: Env, req: Request, pathParts: string[]): Promise<Response> {
+  // Handle OPTIONS preflight
+  if (req.method === 'OPTIONS') {
+    const headers = new Headers();
+    addCorsHeaders(headers);
+    headers.set('Access-Control-Max-Age', '86400');
+    return new Response(null, { status: 204, headers });
+  }
+
+  // /api/v1/plugins
+  if (pathParts.length === 0) {
+    return handlePluginApiList(env);
+  }
+
+  const pluginName = pathParts[0];
+
+  // /api/v1/plugins/:name
+  if (pathParts.length === 1) {
+    return handlePluginApiGet(env, pluginName);
+  }
+
+  const action = pathParts[1];
+
+  // /api/v1/plugins/:name/versions
+  if (action === 'versions') {
+    return handlePluginApiVersions(env, pluginName);
+  }
+
+  // /api/v1/plugins/:name/latest
+  if (action === 'latest') {
+    return handlePluginApiLatest(env, pluginName);
+  }
+
+  // /api/v1/plugins/:name/install
+  if (action === 'install' && req.method === 'POST') {
+    return handlePluginApiInstall(req);
+  }
+
+  // /api/v1/plugins/:name/:version
+  if (pathParts.length === 2) {
+    return handlePluginApiVersion(env, pluginName, action);
+  }
+
+  return jsonResponse({ error: 'Unknown API endpoint' }, 404);
+}
 
 export default {
-  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
     let path = url.pathname;
+
+    // Apply rate limiting for downloads and API endpoints
+    if (shouldRateLimit(path)) {
+      const clientIp = req.headers.get('CF-Connecting-IP') || 'unknown';
+      const { success } = await env.RATE_LIMITER.limit({ key: clientIp });
+      if (!success) {
+        return rateLimitExceeded();
+      }
+    }
+
     if (path === '/' || path === '') {
       return new Response(
         JSON.stringify({
@@ -153,24 +538,37 @@ export default {
 
     // Direct manifest
     if (path === '/latest.json') {
-      return serveObject(env, env.LATEST_MANIFEST, req);
+      return serveObjectOrDirectory(env, env.LATEST_MANIFEST, path, req);
     }
 
     // Public GPG key
     if (path === '/gpg.key') {
-      return serveObject(env, 'gpg.key', req);
+      return serveObjectOrDirectory(env, 'gpg.key', path, req);
     }
 
     // APT repo paths
     if (path.startsWith('/aptrepo')) {
       const key = normalizePath(path.replace('/aptrepo', env.APT_PREFIX));
-      return serveObject(env, key, req);
+      return serveObjectOrDirectory(env, key, path, req);
     }
 
     // YUM repo paths
     if (path.startsWith('/yumrepo')) {
       const key = normalizePath(path.replace('/yumrepo', env.YUM_PREFIX));
-      return serveObject(env, key, req);
+      return serveObjectOrDirectory(env, key, path, req);
+    }
+
+    // Plugin Registry API
+    if (path.startsWith('/api/v1/plugins')) {
+      const apiPath = path.replace('/api/v1/plugins', '').replace(/^\//, '');
+      const pathParts = apiPath.length > 0 ? apiPath.split('/') : [];
+      return handlePluginApi(env, req, pathParts);
+    }
+
+    // Plugin repo paths (file downloads)
+    if (path.startsWith('/plugins')) {
+      const key = normalizePath(path);
+      return serveObjectOrDirectory(env, key, path, req);
     }
 
     return notFound('unknown route', req.headers.get('CF-Ray') || undefined);
