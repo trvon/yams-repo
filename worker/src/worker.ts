@@ -30,7 +30,7 @@
 
 export interface Env {
   REPO_BUCKET: R2Bucket;
-  RATE_LIMITER: RateLimit;
+  RATE_LIMITER?: RateLimit;  // Optional - may not be available in all deployments
   APT_PREFIX: string;
   YUM_PREFIX: string;
   LATEST_MANIFEST: string;
@@ -512,8 +512,8 @@ export default {
     const url = new URL(req.url);
     let path = url.pathname;
 
-    // Apply rate limiting for downloads and API endpoints
-    if (shouldRateLimit(path)) {
+    // Apply rate limiting for downloads and API endpoints (if rate limiter is available)
+    if (shouldRateLimit(path) && env.RATE_LIMITER) {
       const clientIp = req.headers.get('CF-Connecting-IP') || 'unknown';
       const { success } = await env.RATE_LIMITER.limit({ key: clientIp });
       if (!success) {
