@@ -139,11 +139,16 @@ async function serveObjectOrDirectory(
     headers.set('Cache-Control', 'public, max-age=300');
   }
 
-  // ETag / conditional
-  const etag = obj.httpEtag || 'W/"' + (await obj.arrayBuffer()).byteLength + '"';
+  // ETag / conditional — use httpEtag from R2 (always set); never read body for ETag
+  const etag = obj.httpEtag || `W/"${obj.size}"`;
   headers.set('ETag', etag);
+  if (obj.size !== undefined) {
+    headers.set('Content-Length', String(obj.size));
+  }
   const ifNone = req.headers.get('If-None-Match');
   if (ifNone && ifNone === etag) {
+    // Must cancel the body to avoid resource leak
+    obj.body?.cancel?.();
     return new Response(null, { status: 304, headers });
   }
 
@@ -509,15 +514,21 @@ async function handlePluginApi(env: Env, req: Request, pathParts: string[]): Pro
 
 export default {
   async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+    try {
     const url = new URL(req.url);
     let path = url.pathname;
 
     // Apply rate limiting for downloads and API endpoints
     if (shouldRateLimit(path)) {
-      const clientIp = req.headers.get('CF-Connecting-IP') || 'unknown';
-      const { success } = await env.RATE_LIMITER.limit({ key: clientIp });
-      if (!success) {
-        return rateLimitExceeded();
+      try {
+        const clientIp = req.headers.get('CF-Connecting-IP') || 'unknown';
+        const { success } = await env.RATE_LIMITER.limit({ key: clientIp });
+        if (!success) {
+          return rateLimitExceeded();
+        }
+      } catch (e) {
+        // Rate limiter binding may not be configured; allow request through
+        console.warn('Rate limiter error (allowing request):', e);
       }
     }
 
@@ -572,5 +583,12 @@ export default {
     }
 
     return notFound('unknown route', req.headers.get('CF-Ray') || undefined);
+    } catch (err) {
+      console.error('Worker unhandled error:', err);
+      return new Response(
+        JSON.stringify({ error: 'Internal server error', message: String(err) }),
+        { status: 500, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+      );
+    }
   }
 };
