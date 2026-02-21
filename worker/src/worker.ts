@@ -30,7 +30,7 @@
 
 export interface Env {
   REPO_BUCKET: R2Bucket;
-  RATE_LIMITER: RateLimit;
+  RATE_LIMITER?: RateLimit;  // Optional - may not be available in all deployments
   APT_PREFIX: string;
   YUM_PREFIX: string;
   LATEST_MANIFEST: string;
