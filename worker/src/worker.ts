@@ -519,7 +519,7 @@ export default {
     let path = url.pathname;
 
     // Apply rate limiting for downloads and API endpoints
-    if (shouldRateLimit(path)) {
+    if (shouldRateLimit(path) && env.RATE_LIMITER) {
       try {
         const clientIp = req.headers.get('CF-Connecting-IP') || 'unknown';
         const { success } = await env.RATE_LIMITER.limit({ key: clientIp });
