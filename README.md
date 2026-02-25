@@ -1,23 +1,24 @@
-# YAMS Repository Worker
+# YAMS Package Repository
 
-Cloudflare Worker serving APT/YUM packages, plugin registry, and browsable directory listings from R2.
+YAMS package and plugin distribution service, backed by Cloudflare Workers and R2.
 
-**Base URL:** `https://repo.yamsmemory.ai`
+- Base URL: `https://repo.yamsmemory.ai`
+- Serves: APT, YUM/DNF, plugin bundles, and plugin registry APIs
 
-## Install YAMS
+## Install `yams`
 
 ### Debian / Ubuntu (APT)
 
+Current setup (unsigned repo):
+
 ```bash
-# Add the repository (unsigned — GPG signing coming soon)
 echo "deb [trusted=yes] https://repo.yamsmemory.ai/aptrepo stable main" \
   | sudo tee /etc/apt/sources.list.d/yams.list
-
-# Install
-sudo apt-get update && sudo apt-get install yams
+sudo apt-get update
+sudo apt-get install yams
 ```
 
-Once GPG signing is configured:
+Signed setup (use when signing is enabled):
 
 ```bash
 curl -fsSL https://repo.yamsmemory.ai/gpg.key \
@@ -25,8 +26,8 @@ curl -fsSL https://repo.yamsmemory.ai/gpg.key \
 
 echo "deb [signed-by=/usr/share/keyrings/yams.gpg] https://repo.yamsmemory.ai/aptrepo stable main" \
   | sudo tee /etc/apt/sources.list.d/yams.list
-
-sudo apt-get update && sudo apt-get install yams
+sudo apt-get update
+sudo apt-get install yams
 ```
 
 ### Fedora / RHEL / openSUSE (YUM / DNF)
@@ -41,7 +42,8 @@ gpgcheck=0
 repo_gpgcheck=0
 REPO
 
-sudo dnf makecache && sudo dnf install yams
+sudo dnf makecache
+sudo dnf install yams
 ```
 
 ### macOS (Homebrew)
@@ -52,45 +54,50 @@ brew install trvon/yams/yams
 
 ### Direct Download
 
-Download the latest release archive or package directly:
-
 ```bash
-# Check the latest release manifest
+# Inspect latest release metadata
 curl -fsSL https://repo.yamsmemory.ai/latest.json | jq .
 
-# Or download from GitHub Releases
+# Download package from GitHub Releases
 gh release download --repo trvon/yams --pattern 'yams-*-linux-x86_64.deb'
 sudo dpkg -i yams-*-linux-x86_64.deb
 ```
 
-## API Endpoints
+## Endpoints
 
-### Repository Access
-- `GET /aptrepo/*` — APT packages and metadata
-- `GET /yumrepo/*` — YUM packages and repodata
-- `GET /plugins/*` — Plugin bundles (`.tar.gz`)
-- `GET /latest.json` — Latest release manifest
-- `GET /gpg.key` — GPG public key for verification
+### Repository Paths
+
+- `GET /aptrepo/*` - APT packages and metadata
+- `GET /yumrepo/*` - YUM packages and repodata
+- `GET /plugins/*` - Plugin archives (`.tar.gz`)
+- `GET /latest.json` - Latest release manifest
+- `GET /gpg.key` - Public key for package verification
 
 ### Plugin Registry API
-- `GET /api/v1/plugins` — List all plugins
-- `GET /api/v1/plugins/:name` — Plugin metadata
-- `GET /api/v1/plugins/:name/versions` — All versions
-- `GET /api/v1/plugins/:name/:version` — Specific version
-- `GET /api/v1/plugins/:name/latest` — Latest version
-- `POST /api/v1/plugins/:name/install` — Track installation (metrics)
 
-### Browsable Index
+- `GET /api/v1/plugins` - List plugins
+- `GET /api/v1/plugins/:name` - Plugin metadata
+- `GET /api/v1/plugins/:name/versions` - All plugin versions
+- `GET /api/v1/plugins/:name/:version` - Version metadata
+- `GET /api/v1/plugins/:name/latest` - Latest plugin version
+- `POST /api/v1/plugins/:name/install` - Installation telemetry endpoint
 
-All repository paths serve an HTML directory listing when accessed in a browser (e.g., `https://repo.yamsmemory.ai/aptrepo/`).
+### Browsable Indexes
 
-## Development
+Repository paths are browsable in a web browser, for example:
+
+- `https://repo.yamsmemory.ai/aptrepo/`
+- `https://repo.yamsmemory.ai/yumrepo/`
+
+## Development (Worker)
+
+Requirements: Node.js `>= 18`
 
 ```bash
 cd worker
 npm install
-npm run dev       # wrangler dev
-npm test          # vitest
+npm run dev
+npm test
 ```
 
 ## License
