@@ -9,17 +9,6 @@ YAMS package and plugin distribution service, backed by Cloudflare Workers and R
 
 ### Debian / Ubuntu (APT)
 
-Current setup (unsigned repo):
-
-```bash
-echo "deb [trusted=yes] https://repo.yamsmemory.ai/aptrepo stable main" \
-  | sudo tee /etc/apt/sources.list.d/yams.list
-sudo apt-get update
-sudo apt-get install yams
-```
-
-Signed setup (use when signing is enabled):
-
 ```bash
 curl -fsSL https://repo.yamsmemory.ai/gpg.key \
   | sudo gpg --dearmor -o /usr/share/keyrings/yams.gpg
