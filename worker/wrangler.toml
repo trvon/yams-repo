@@ -6,6 +6,7 @@ compatibility_date = "2025-09-14"
 # Base paths inside R2 bucket
 APT_PREFIX = "aptrepo"
 YUM_PREFIX = "yumrepo"
+ARCH_PREFIX = "archrepo"
 LATEST_MANIFEST = "latest.json"
 
 [[r2_buckets]]

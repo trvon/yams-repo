@@ -363,10 +363,47 @@ function rateLimitExceeded(): Response {
 	);
 }
 
+const CORS_ALLOW_ORIGIN = "https://repo.yamsmemory.ai";
+
 function addCorsHeaders(headers: Headers): void {
-	headers.set("Access-Control-Allow-Origin", "*");
+	headers.set("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN);
+	headers.set("Vary", "Origin");
 	headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 	headers.set("Access-Control-Allow-Headers", "Content-Type");
+}
+
+function parsePluginManifest(
+	manifestText: string,
+	manifestKey: string,
+):
+	| { ok: true; manifest: Record<string, unknown> }
+	| { ok: false; response: Response } {
+	try {
+		const parsed = JSON.parse(manifestText) as unknown;
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return { ok: true, manifest: parsed as Record<string, unknown> };
+		}
+		return {
+			ok: false,
+			response: jsonResponse(
+				{ error: `Plugin manifest '${manifestKey}' is not a JSON object` },
+				502,
+				60,
+			),
+		};
+	} catch (error) {
+		return {
+			ok: false,
+			response: jsonResponse(
+				{
+					error: `Plugin manifest '${manifestKey}' is invalid JSON`,
+					detail: String(error),
+				},
+				502,
+				60,
+			),
+		};
+	}
 }
 
 function jsonResponse(
@@ -398,12 +435,15 @@ async function handlePluginApiList(env: Env): Promise<Response> {
 
 		if (manifestObj) {
 			const manifestText = await manifestObj.text();
-			const manifest = JSON.parse(manifestText);
+			const parsed = parsePluginManifest(manifestText, manifestKey);
+			if (!parsed.ok) return parsed.response;
+			const { manifest } = parsed;
 			plugins.push({
 				name: manifest.name,
 				version: manifest.version,
 				description: manifest.description,
-				downloads: manifest.downloads || 0,
+				downloads:
+					typeof manifest.downloads === "number" ? manifest.downloads : 0,
 			});
 		}
 	}
@@ -423,8 +463,9 @@ async function handlePluginApiGet(
 	}
 
 	const manifestText = await manifestObj.text();
-	const manifest = JSON.parse(manifestText);
-	return jsonResponse(manifest, 200, 3600); // Cache 1 hour
+	const parsed = parsePluginManifest(manifestText, manifestKey);
+	if (!parsed.ok) return parsed.response;
+	return jsonResponse(parsed.manifest, 200, 3600); // Cache 1 hour
 }
 
 async function handlePluginApiVersions(
@@ -475,8 +516,9 @@ async function handlePluginApiVersion(
 	}
 
 	const manifestText = await manifestObj.text();
-	const manifest = JSON.parse(manifestText);
-	return jsonResponse(manifest, 200, 86400); // Cache 24 hours (immutable version)
+	const parsed = parsePluginManifest(manifestText, manifestKey);
+	if (!parsed.ok) return parsed.response;
+	return jsonResponse(parsed.manifest, 200, 86400); // Cache 24 hours (immutable version)
 }
 
 async function handlePluginApiLatest(
@@ -590,7 +632,7 @@ export default {
 	): Promise<Response> {
 		try {
 			const url = new URL(req.url);
-			let path = url.pathname;
+			const path = url.pathname;
 
 			// Apply rate limiting for downloads and API endpoints
 			if (shouldRateLimit(path) && env.RATE_LIMITER) {
