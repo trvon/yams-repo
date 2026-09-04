@@ -38,11 +38,22 @@
 export interface Env {
 	REPO_BUCKET: R2Bucket;
 	RATE_LIMITER?: RateLimit; // Optional - may not be available in all deployments
+	REPOSITORY_CACHE?: Cache; // Test seam; production uses caches.default when available.
 	APT_PREFIX: string;
 	YUM_PREFIX: string;
 	ARCH_PREFIX: string;
 	LATEST_MANIFEST: string;
 }
+
+type RepositoryChannel = "stable" | "experimental";
+
+interface RepositoryRoute {
+	channel: RepositoryChannel;
+	key: string;
+}
+
+const MUTABLE_CACHE_CONTROL = "public, max-age=0, must-revalidate";
+const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
 const SECURITY_HEADERS: Record<string, string> = {
 	"X-Content-Type-Options": "nosniff",
@@ -107,12 +118,34 @@ async function serveObjectOrDirectory(
 	key: string,
 	displayPath: string,
 	req: Request,
+	ctx: ExecutionContext,
+	channel?: RepositoryChannel,
 ): Promise<Response> {
 	// Check if path ends with / (directory request)
 	if (displayPath.endsWith("/")) {
 		const acceptJson =
 			req.headers.get("Accept")?.includes("application/json") || false;
 		return listDirectory(env, key, displayPath, acceptJson);
+	}
+
+	const isImmutable = immutable(key);
+	const cache =
+		isImmutable && channel && req.method === "GET"
+			? repositoryCache(env)
+			: undefined;
+	const cacheRequest = cache
+		? immutableCacheRequest(req, channel as RepositoryChannel, key)
+		: undefined;
+	if (cache && cacheRequest) {
+		const cached = await cache.match(cacheRequest);
+		if (cached) {
+			const cachedEtag = cached.headers.get("ETag");
+			if (cachedEtag && req.headers.get("If-None-Match") === cachedEtag) {
+				cached.body?.cancel();
+				return new Response(null, { status: 304, headers: cached.headers });
+			}
+			return cached;
+		}
 	}
 
 	// Try to serve as file
@@ -144,12 +177,12 @@ async function serveObjectOrDirectory(
 	const ct = guessContentType(key) || "application/octet-stream";
 	headers.set("Content-Type", ct);
 
-	// Basic cache policy
-	if (immutable(key)) {
-		headers.set("Cache-Control", "public, max-age=31536000, immutable");
-	} else {
-		headers.set("Cache-Control", "public, max-age=300");
-	}
+	// Only versioned package payloads enter the Cache API. Mutable repository
+	// metadata must revalidate against its channel-specific R2 key.
+	headers.set(
+		"Cache-Control",
+		isImmutable ? IMMUTABLE_CACHE_CONTROL : MUTABLE_CACHE_CONTROL,
+	);
 
 	// ETag / conditional — use httpEtag from R2 (always set); never read body for ETag
 	const etag = obj.httpEtag || `W/"${obj.size}"`;
@@ -164,12 +197,122 @@ async function serveObjectOrDirectory(
 		return new Response(null, { status: 304, headers });
 	}
 
-	return new Response(obj.body, { status: 200, headers });
+	const response = new Response(obj.body, { status: 200, headers });
+	if (cache && cacheRequest) {
+		ctx.waitUntil(
+			cache.put(cacheRequest, response.clone()).catch((error: unknown) => {
+				console.warn("Immutable repository cache put failed:", error);
+			}),
+		);
+	}
+	return response;
 }
 
 function normalizePath(p: string): string {
 	if (p.startsWith("/")) p = p.slice(1);
 	return p;
+}
+
+function rawPathname(requestUrl: string): string {
+	const authority = requestUrl.indexOf("://");
+	if (authority < 0) return new URL(requestUrl, "https://repository.invalid").pathname;
+	const pathStart = requestUrl.indexOf("/", authority + 3);
+	if (pathStart < 0) return "/";
+	const queryStart = requestUrl.indexOf("?", pathStart);
+	const fragmentStart = requestUrl.indexOf("#", pathStart);
+	const pathEnd = Math.min(
+		queryStart < 0 ? requestUrl.length : queryStart,
+		fragmentStart < 0 ? requestUrl.length : fragmentStart,
+	);
+	return requestUrl.slice(pathStart, pathEnd);
+}
+
+function hasPathBoundary(path: string, prefix: string): boolean {
+	return path === prefix || path.startsWith(`${prefix}/`);
+}
+
+function isRepositoryCandidate(path: string): boolean {
+	return [
+		"/aptrepo",
+		"/yumrepo",
+		"/archrepo",
+		"/latest.json",
+		"/gpg.key",
+		"/experimental",
+	].some((prefix) => path.startsWith(prefix));
+}
+
+function isUnsafeRepositoryPath(path: string): boolean {
+	return (
+		path.includes("%") ||
+		path.includes("\\") ||
+		path.split("/").some((part) => part === "." || part === "..")
+	);
+}
+
+function repositoryKey(prefix: string, routePrefix: string, path: string): string {
+	return normalizePath(`${prefix}${path.slice(routePrefix.length)}`);
+}
+
+function resolveRepositoryRoute(path: string, env: Env): RepositoryRoute | null {
+	if (isRepositoryCandidate(path) && isUnsafeRepositoryPath(path)) return null;
+
+	if (path === "/experimental/latest.json") {
+		return { channel: "experimental", key: "experimental/latest.json" };
+	}
+
+	const experimentalRoutes = [
+		["/experimental/aptrepo", env.APT_PREFIX],
+		["/experimental/yumrepo", env.YUM_PREFIX],
+		["/experimental/archrepo", env.ARCH_PREFIX],
+	] as const;
+	for (const [routePrefix, objectPrefix] of experimentalRoutes) {
+		if (hasPathBoundary(path, routePrefix)) {
+			return {
+				channel: "experimental",
+				key: `experimental/${repositoryKey(objectPrefix, routePrefix, path)}`,
+			};
+		}
+	}
+
+	if (path === "/latest.json") {
+		return { channel: "stable", key: env.LATEST_MANIFEST };
+	}
+	if (path === "/gpg.key") {
+		return { channel: "stable", key: "gpg.key" };
+	}
+
+	const stableRoutes = [
+		["/aptrepo", env.APT_PREFIX],
+		["/yumrepo", env.YUM_PREFIX],
+		["/archrepo", env.ARCH_PREFIX],
+	] as const;
+	for (const [routePrefix, objectPrefix] of stableRoutes) {
+		if (hasPathBoundary(path, routePrefix)) {
+			return {
+				channel: "stable",
+				key: repositoryKey(objectPrefix, routePrefix, path),
+			};
+		}
+	}
+	return null;
+}
+
+function repositoryCache(env: Env): Cache | undefined {
+	if (env.REPOSITORY_CACHE) return env.REPOSITORY_CACHE;
+	return typeof caches === "undefined" ? undefined : caches.default;
+}
+
+function immutableCacheRequest(
+	req: Request,
+	channel: RepositoryChannel,
+	key: string,
+): Request {
+	const url = new URL(req.url);
+	const encodedKey = key.split("/").map(encodeURIComponent).join("/");
+	url.pathname = `/__yams_repository_cache/${channel}/${encodedKey}`;
+	url.search = "";
+	return new Request(url.toString(), { method: "GET" });
 }
 
 function escapeHtml(unsafe: string): string {
@@ -313,7 +456,7 @@ async function listDirectory(
 </html>`;
 
 	headers.set("Content-Type", "text/html; charset=utf-8");
-	headers.set("Cache-Control", "public, max-age=60");
+	headers.set("Cache-Control", MUTABLE_CACHE_CONTROL);
 	return new Response(html, { headers });
 }
 
@@ -342,7 +485,8 @@ function shouldRateLimit(path: string): boolean {
 		path.endsWith(".pkg.tar.zst") ||
 		path.endsWith(".tar.gz") ||
 		path.startsWith("/api/") ||
-		path === "/latest.json"
+		path === "/latest.json" ||
+		path === "/experimental/latest.json"
 	);
 }
 
@@ -633,6 +777,7 @@ export default {
 		try {
 			const url = new URL(req.url);
 			const path = url.pathname;
+			const repositoryPath = rawPathname(req.url);
 
 			// Apply rate limiting for downloads and API endpoints
 			if (shouldRateLimit(path) && env.RATE_LIMITER) {
@@ -668,32 +813,22 @@ export default {
 				);
 			}
 
-			// Direct manifest
-			if (path === "/latest.json") {
-				return serveObjectOrDirectory(env, env.LATEST_MANIFEST, path, req);
+			const repositoryRoute = resolveRepositoryRoute(repositoryPath, env);
+			if (repositoryRoute) {
+				return serveObjectOrDirectory(
+					env,
+					repositoryRoute.key,
+					repositoryPath,
+					req,
+					_ctx,
+					repositoryRoute.channel,
+				);
 			}
-
-			// Public GPG key
-			if (path === "/gpg.key") {
-				return serveObjectOrDirectory(env, "gpg.key", path, req);
-			}
-
-			// APT repo paths
-			if (path.startsWith("/aptrepo")) {
-				const key = normalizePath(path.replace("/aptrepo", env.APT_PREFIX));
-				return serveObjectOrDirectory(env, key, path, req);
-			}
-
-			// YUM repo paths
-			if (path.startsWith("/yumrepo")) {
-				const key = normalizePath(path.replace("/yumrepo", env.YUM_PREFIX));
-				return serveObjectOrDirectory(env, key, path, req);
-			}
-
-			// Arch repo paths
-			if (path.startsWith("/archrepo")) {
-				const key = normalizePath(path.replace("/archrepo", env.ARCH_PREFIX));
-				return serveObjectOrDirectory(env, key, path, req);
+			if (isRepositoryCandidate(repositoryPath)) {
+				return notFound(
+					"unknown route",
+					req.headers.get("CF-Ray") || undefined,
+				);
 			}
 
 			// Plugin Registry API
@@ -706,7 +841,7 @@ export default {
 			// Plugin repo paths (file downloads)
 			if (path.startsWith("/plugins")) {
 				const key = normalizePath(path);
-				return serveObjectOrDirectory(env, key, path, req);
+				return serveObjectOrDirectory(env, key, path, req, _ctx);
 			}
 
 			return notFound("unknown route", req.headers.get("CF-Ray") || undefined);

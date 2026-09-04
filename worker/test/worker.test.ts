@@ -11,6 +11,36 @@ import type { Env } from "../src/worker";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type JsonObject = any;
 
+function createRawPathRequest(path: string): Request {
+	const request = createMockRequest("https://repo.yams.dev/");
+	Object.defineProperty(request, "url", {
+		value: `https://repo.yams.dev${path}`,
+	});
+	return request;
+}
+
+class RecordingCache {
+	readonly matchedKeys: string[] = [];
+	readonly storedKeys: string[] = [];
+	private readonly entries = new Map<string, Response>();
+
+	private key(request: RequestInfo | URL): string {
+		return request instanceof Request ? request.url : String(request);
+	}
+
+	async match(request: RequestInfo | URL): Promise<Response | undefined> {
+		const key = this.key(request);
+		this.matchedKeys.push(key);
+		return this.entries.get(key)?.clone();
+	}
+
+	async put(request: RequestInfo | URL, response: Response): Promise<void> {
+		const key = this.key(request);
+		this.storedKeys.push(key);
+		this.entries.set(key, response.clone());
+	}
+}
+
 describe("YAMS Repository Worker", () => {
 	let env: Env;
 	let ctx: MockExecutionContext;
@@ -165,7 +195,7 @@ describe("YAMS Repository Worker", () => {
 			);
 		});
 
-		it("should serve metadata with short cache", async () => {
+		it("should require metadata revalidation", async () => {
 			getMockBucket(env).set("aptrepo/dists/stable/Release", "test");
 
 			const req = createMockRequest(
@@ -174,7 +204,9 @@ describe("YAMS Repository Worker", () => {
 			const res = await worker.fetch(req, env, ctx);
 
 			expect(res.status).toBe(200);
-			expect(res.headers.get("Cache-Control")).toBe("public, max-age=300");
+			expect(res.headers.get("Cache-Control")).toBe(
+				"public, max-age=0, must-revalidate",
+			);
 		});
 	});
 
@@ -294,6 +326,133 @@ describe("YAMS Repository Worker", () => {
 			const res = await worker.fetch(req, env, ctx);
 
 			expect(res.headers.get("Content-Type")).toBe("application/x-xz");
+		});
+	});
+
+	describe("Experimental repository isolation", () => {
+		it("maps each exact experimental route into its channel prefix", async () => {
+			const bucket = getMockBucket(env);
+			bucket.set("experimental/aptrepo/dists/experimental/Release", "apt");
+			bucket.set("experimental/yumrepo/repodata/repomd.xml", "yum");
+			bucket.set("experimental/archrepo/os/x86_64/yams.db", "arch");
+			bucket.set("experimental/latest.json", '{"channel":"nightly"}');
+
+			const cases = [
+				["/experimental/aptrepo/dists/experimental/Release", "apt"],
+				["/experimental/yumrepo/repodata/repomd.xml", "yum"],
+				["/experimental/archrepo/os/x86_64/yams.db", "arch"],
+				["/experimental/latest.json", '{"channel":"nightly"}'],
+			] as const;
+			for (const [path, expected] of cases) {
+				const response = await worker.fetch(
+					createMockRequest(`https://repo.yams.dev${path}`),
+					env,
+					ctx,
+				);
+				expect(response.status, path).toBe(200);
+				expect(await response.text(), path).toBe(expected);
+			}
+		});
+
+		it("rejects prefix-confused repository routes", async () => {
+			const paths = [
+				"/aptrepository/file.deb",
+				"/yumrepository/file.rpm",
+				"/archrepository/file.pkg.tar.zst",
+				"/experimental/aptrepository/file.deb",
+				"/experimental/yumrepository/file.rpm",
+				"/experimental/archrepository/file.pkg.tar.zst",
+				"/experimental-other/aptrepo/file.deb",
+				"/experimental/latest.json/extra",
+			];
+			for (const path of paths) {
+				const response = await worker.fetch(
+					createMockRequest(`https://repo.yams.dev${path}`),
+					env,
+					ctx,
+				);
+				expect(response.status, path).toBe(404);
+			}
+		});
+
+		it("rejects raw and percent-encoded traversal or separators", async () => {
+			getMockBucket(env).set("latest.json", "stable-secret");
+			getMockBucket(env).set("experimental/latest.json", "experimental-secret");
+			const paths = [
+				"/aptrepo/../latest.json",
+				"/experimental/aptrepo/../../latest.json",
+				"/experimental/aptrepo/%2e%2e/latest.json",
+				"/experimental/aptrepo/%2Flatest.json",
+				"/experimental/%61ptrepo/file.deb",
+				"/aptrepo/file%2Edeb",
+			];
+			for (const path of paths) {
+				const response = await worker.fetch(createRawPathRequest(path), env, ctx);
+				expect(response.status, path).toBe(404);
+				expect(await response.text(), path).not.toContain("secret");
+			}
+		});
+
+		it("keeps immutable cache keys and payloads channel-specific", async () => {
+			const bucket = getMockBucket(env);
+			bucket.set("aptrepo/pool/yams.deb", "stable", '"stable-etag"');
+			bucket.set(
+				"experimental/aptrepo/pool/yams.deb",
+				"experimental",
+				'"experimental-etag"',
+			);
+			const cache = new RecordingCache();
+			(env as Env & { REPOSITORY_CACHE: Cache }).REPOSITORY_CACHE =
+				cache as unknown as Cache;
+
+			const stable = await worker.fetch(
+				createMockRequest("https://repo.yams.dev/aptrepo/pool/yams.deb"),
+				env,
+				ctx,
+			);
+			const experimental = await worker.fetch(
+				createMockRequest(
+					"https://repo.yams.dev/experimental/aptrepo/pool/yams.deb",
+				),
+				env,
+				ctx,
+			);
+
+			expect(await stable.text()).toBe("stable");
+			expect(await experimental.text()).toBe("experimental");
+			expect(cache.matchedKeys).toHaveLength(2);
+			expect(new Set(cache.matchedKeys).size).toBe(2);
+			expect(cache.matchedKeys[0]).toContain("/stable/");
+			expect(cache.matchedKeys[1]).toContain("/experimental/");
+		});
+
+		it("never stores mutable metadata in the immutable cache", async () => {
+			const bucket = getMockBucket(env);
+			bucket.set("aptrepo/dists/stable/Release", "stable metadata");
+			bucket.set(
+				"experimental/aptrepo/dists/experimental/Release",
+				"experimental metadata",
+			);
+			const cache = new RecordingCache();
+			(env as Env & { REPOSITORY_CACHE: Cache }).REPOSITORY_CACHE =
+				cache as unknown as Cache;
+
+			for (const path of [
+				"/aptrepo/dists/stable/Release",
+				"/experimental/aptrepo/dists/experimental/Release",
+			]) {
+				const response = await worker.fetch(
+					createMockRequest(`https://repo.yams.dev${path}`),
+					env,
+					ctx,
+				);
+				expect(response.status).toBe(200);
+				expect(response.headers.get("Cache-Control")).toBe(
+					"public, max-age=0, must-revalidate",
+				);
+			}
+			expect(cache.matchedKeys).toEqual([]);
+			expect(cache.storedKeys).toEqual([]);
 		});
 	});
 });
