@@ -142,6 +142,20 @@ describe("YAMS Repository Worker", () => {
 		});
 	});
 
+	describe("non-repository object caching", () => {
+		it("preserves short caching for plugin downloads", async () => {
+			getMockBucket(env).set("plugins/example/1.0.0/plugin.tar.gz", "plugin");
+
+			const req = createMockRequest(
+				"https://repo.yams.dev/plugins/example/1.0.0/plugin.tar.gz",
+			);
+			const res = await worker.fetch(req, env, ctx);
+
+			expect(res.status).toBe(200);
+			expect(res.headers.get("Cache-Control")).toBe("public, max-age=300");
+		});
+	});
+
 	describe("APT repository endpoint", () => {
 		it("should serve Release file", async () => {
 			const release = "Origin: YAMS\nLabel: YAMS\nSuite: stable";

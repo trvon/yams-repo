@@ -53,6 +53,7 @@ interface RepositoryRoute {
 }
 
 const MUTABLE_CACHE_CONTROL = "public, max-age=0, must-revalidate";
+const DEFAULT_CACHE_CONTROL = "public, max-age=300";
 const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
 const SECURITY_HEADERS: Record<string, string> = {
@@ -133,9 +134,8 @@ async function serveObjectOrDirectory(
 		isImmutable && channel && req.method === "GET"
 			? repositoryCache(env)
 			: undefined;
-	const cacheRequest = cache
-		? immutableCacheRequest(req, channel as RepositoryChannel, key)
-		: undefined;
+	const cacheRequest =
+		cache && channel ? immutableCacheRequest(req, channel, key) : undefined;
 	if (cache && cacheRequest) {
 		const cached = await cache.match(cacheRequest);
 		if (cached) {
@@ -181,7 +181,11 @@ async function serveObjectOrDirectory(
 	// metadata must revalidate against its channel-specific R2 key.
 	headers.set(
 		"Cache-Control",
-		isImmutable ? IMMUTABLE_CACHE_CONTROL : MUTABLE_CACHE_CONTROL,
+		isImmutable
+			? IMMUTABLE_CACHE_CONTROL
+			: channel
+				? MUTABLE_CACHE_CONTROL
+				: DEFAULT_CACHE_CONTROL,
 	);
 
 	// ETag / conditional — use httpEtag from R2 (always set); never read body for ETag
