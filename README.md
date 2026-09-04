@@ -91,6 +91,56 @@ gh release download --repo trvon/yams --pattern 'yams-*-linux-x86_64.deb'
 sudo dpkg -i yams-*-linux-x86_64.deb
 ```
 
+### Experimental channel
+
+Nightly and weekly releases share one experimental repository namespace. They
+never publish to the stable keys above:
+
+- APT: `https://repo.yamsmemory.ai/experimental/aptrepo` with distribution
+  `experimental`
+- YUM: `https://repo.yamsmemory.ai/experimental/yumrepo/`
+- Arch: `https://repo.yamsmemory.ai/experimental/archrepo/os/$arch`
+- Manifest: `https://repo.yamsmemory.ai/experimental/latest.json`
+- APT public key:
+  `https://repo.yamsmemory.ai/experimental/aptrepo/gpg.key`
+
+Do not configure a stable client to use an experimental URL or signing key.
+
+## Repository publication operations
+
+Stable and experimental publication are separate authorities. Keep the existing
+stable credentials in `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
+`GPG_PRIVATE_KEY`, `GPG_PASSPHRASE`, and `GPG_PUBLIC_KEY_B64`. Provision distinct
+experimental credentials in `EXPERIMENTAL_CLOUDFLARE_API_TOKEN`,
+`EXPERIMENTAL_CLOUDFLARE_ACCOUNT_ID`, `EXPERIMENTAL_GPG_PRIVATE_KEY`,
+`EXPERIMENTAL_GPG_PASSPHRASE`, and `EXPERIMENTAL_GPG_PUBLIC_KEY_B64`. Never copy
+the stable signing key or stable R2 token into an experimental secret. Scope each
+Cloudflare token to only the repository authority needed by its workflow; the
+publisher additionally enforces the channel prefix in its validated plan.
+
+Publication is deliberately ordered:
+
+1. Validate the downloaded `release-manifest` artifact against the selected
+   Release run ID, run attempt, source ref, and requested publication channel.
+2. Upload immutable package payloads. An existing byte-identical object is an
+   idempotent success; an existing object with different bytes is a hard conflict.
+3. Upload mutable repository metadata and that channel's public key.
+4. Write that channel's `latest.json` last.
+
+If a run stops before `latest.json`, do not delete or prune anything. Fix the
+failed step and rerun the same Release run and attempt through
+`publish-repos.yml`; identical immutable payloads are skipped, metadata is
+replayed, and `latest.json` advances only after all prior writes succeed. If the
+final `latest.json` write itself fails, use the same recovery. Never prune old
+packages as part of publishing or recovery: repository metadata or existing
+clients may still reference them, and immutable-object conflicts must be
+investigated rather than overwritten.
+
+For experimental republishing, `run_id` is mandatory. For stable republishing,
+an explicit run ID is preferred; leaving it empty selects the latest successful
+tag-triggered Release run. In both cases, the manifest channel is authoritative
+and a stable/experimental mismatch fails closed before any R2 operation.
+
 ## Endpoints
 
 ### Repository Paths
@@ -102,7 +152,14 @@ sudo dpkg -i yams-*-linux-x86_64.deb
   - package indexes: `/archrepo/os/x86_64/`, `/archrepo/os/aarch64/`
 - `GET /plugins/*` - Plugin archives (`.tar.gz`)
 - `GET /latest.json` - Latest release manifest
-- `GET /gpg.key` - Public key for package verification
+- `GET /gpg.key` - Stable public key for package verification
+- `GET /experimental/aptrepo/*` - Experimental APT packages and metadata
+- `GET /experimental/yumrepo/*` - Experimental YUM packages and repodata
+- `GET /experimental/archrepo/*` - Experimental Arch packages and metadata
+- `GET /experimental/latest.json` - Latest nightly or weekly release manifest
+
+Repository routes use exact segment boundaries. Encoded paths, traversal
+segments, and lookalike prefixes such as `/aptrepository` are rejected.
 
 ### Plugin Registry API
 
