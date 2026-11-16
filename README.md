@@ -65,7 +65,7 @@ sudo tee -a /etc/pacman.conf <<'REPO'
 Include = /etc/pacman.d/yams.conf
 REPO
 
-sudo pacman -Sy yams
+sudo pacman -Syu yams
 ```
 
 The worker serves the standard Arch layout under `/archrepo/os/$arch/`:
@@ -111,8 +111,9 @@ Do not configure a stable client to use an experimental URL or signing key.
 Nightlies are versioned after the stable release they build on (for example
 `0.23.0+nightly.20261116+g1234abcd`), so a normal upgrade moves you to the next
 nightly and then to the next stable release. Configure the experimental
-repository **instead of** the stable one. With both configured, apt and dnf pick
-the higher version, and pacman installs from whichever repository it lists first.
+repository **instead of** the stable one. apt and dnf can hold both and pick the
+higher version; pacman cannot, because both channels serve the same `[yams]`
+repository, so on Arch you switch that one entry between channels.
 
 Debian / Ubuntu (signed):
 
@@ -155,7 +156,7 @@ REPO
 
 grep -q '^Include = /etc/pacman.d/yams.conf' /etc/pacman.conf \
   || echo 'Include = /etc/pacman.d/yams.conf' | sudo tee -a /etc/pacman.conf
-sudo pacman -Sy yams
+sudo pacman -Syu yams
 ```
 
 The section must be named `[yams]`: pacman downloads `<Server>/<section>.db`,
@@ -175,7 +176,8 @@ curl -fsSL https://repo.yamsmemory.ai/experimental/latest.json \
 To return to stable, restore the stable repository entry above and reinstall
 `yams` from it. A stable release can have a lower version than the nightly you
 are on, so apt needs `sudo apt-get install --allow-downgrades yams=<version>`,
-dnf needs `sudo dnf downgrade yams`, and pacman needs `sudo pacman -S yams`.
+dnf needs `sudo dnf downgrade yams`, and pacman needs `sudo pacman -Syuu`
+(the doubled `u` lets it move yams back to the lower stable version).
 
 ## Repository publication operations
 
