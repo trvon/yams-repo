@@ -106,6 +106,77 @@ never publish to the stable keys above:
 
 Do not configure a stable client to use an experimental URL or signing key.
 
+### Install a nightly
+
+Nightlies are versioned after the stable release they build on (for example
+`0.23.0+nightly.20261116+g1234abcd`), so a normal upgrade moves you to the next
+nightly and then to the next stable release. Configure the experimental
+repository **instead of** the stable one. With both configured, apt and dnf pick
+the higher version, and pacman installs from whichever repository it lists first.
+
+Debian / Ubuntu (signed):
+
+```bash
+curl -fsSL https://repo.yamsmemory.ai/experimental/aptrepo/gpg.key \
+  | sudo gpg --dearmor -o /usr/share/keyrings/yams-experimental.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/yams-experimental.gpg] https://repo.yamsmemory.ai/experimental/aptrepo experimental main" \
+  | sudo tee /etc/apt/sources.list.d/yams.list
+sudo apt-get update
+sudo apt-get install yams
+```
+
+Fedora / RHEL / openSUSE (repository metadata is signed with the same key):
+
+```bash
+sudo tee /etc/yum.repos.d/yams.repo <<'REPO'
+[yams-experimental]
+name=YAMS Experimental (nightly and weekly)
+baseurl=https://repo.yamsmemory.ai/experimental/yumrepo/
+enabled=1
+gpgcheck=0
+repo_gpgcheck=1
+gpgkey=https://repo.yamsmemory.ai/experimental/aptrepo/gpg.key
+REPO
+
+# -y accepts the repository key shown above (fingerprint E2646EAD...C95312AE).
+sudo dnf makecache -y
+sudo dnf install yams
+```
+
+Arch Linux (unsigned, like the stable Arch repository):
+
+```bash
+sudo tee /etc/pacman.d/yams.conf <<'REPO'
+[yams]
+SigLevel = Optional TrustAll
+Server = https://repo.yamsmemory.ai/experimental/archrepo/os/$arch
+REPO
+
+grep -q '^Include = /etc/pacman.d/yams.conf' /etc/pacman.conf \
+  || echo 'Include = /etc/pacman.d/yams.conf' | sudo tee -a /etc/pacman.conf
+sudo pacman -Sy yams
+```
+
+The section must be named `[yams]`: pacman downloads `<Server>/<section>.db`,
+and both channels serve `yams.db`. This file replaces the stable entry, which is
+what keeps the two channels apart. Arch nightlies published before the
+`<base>.nightly.<date>.g<sha>` version scheme are named `nightly_<date>_<sha>`
+and sort below every stable release, so `pacman -Syu` with a stable repository
+configured would replace one with stable.
+
+Check what the channel currently offers:
+
+```bash
+curl -fsSL https://repo.yamsmemory.ai/experimental/latest.json \
+  | jq -r '.assets[].filename'
+```
+
+To return to stable, restore the stable repository entry above and reinstall
+`yams` from it. A stable release can have a lower version than the nightly you
+are on, so apt needs `sudo apt-get install --allow-downgrades yams=<version>`,
+dnf needs `sudo dnf downgrade yams`, and pacman needs `sudo pacman -S yams`.
+
 ## Repository publication operations
 
 Stable and experimental publication are separate authorities. Keep the existing
